@@ -1,10 +1,9 @@
 /**
  * kernel.c — Главный файл ядра
  *
- * Изменения:
- *   - video_init() теперь реально инициализирует framebuffer
- *   - После успешного video_init() весь вывод дублируется на HDMI
- *   - shell_run() передаём флаг video_available для дублирования
+ * v0.2: Добавлена инициализация USB HID клавиатуры.
+ *       Новый глобальный флаг: g_usb_available.
+ *       USB инициализируется после video, перед shell.
  */
 
 #include <stddef.h>
@@ -17,13 +16,15 @@
 #include "../../include/printf.h"
 #include "../../include/video.h"
 #include "../../include/console_mux.h"
+#include "../../include/usb.h"          /* <<<< ДОБАВЛЕНО */
 
 #define OS_NAME     "RaspberryOS Mini"
-#define OS_VERSION  "0.1.0"
+#define OS_VERSION  "0.2.0"
 
 volatile int      g_kernel_panic    = 0;
 volatile uint64_t g_uptime_ticks    = 0;
 volatile int      g_video_available = 0;
+volatile int      g_usb_available   = 0;   /* <<<< ДОБАВЛЕНО */
 
 /* ----------------------------------------------------------------
  * ANSI цвета для UART
@@ -56,7 +57,7 @@ static void print_banner(void) {
     uart_puts(" |_| \\_\\_|   |_| |_|_|  |_|_|\r\n");
     uart_puts(COLOR_RESET_A);
     uart_puts(COLOR_BOLD_A);
-    uart_puts("  RaspberryOS Mini v0.1\r\n");
+    uart_puts("  RaspberryOS Mini v0.2\r\n");
     uart_puts(COLOR_RESET_A);
     uart_puts("  Bare-metal OS for Raspberry Pi 4\r\n");
     uart_puts("  ----------------------------------------\r\n\r\n");
@@ -73,7 +74,7 @@ static void print_banner_hdmi(void) {
     console_puts(" |  _ <|  __/| | | | |  | | |\r\n");
     console_puts(" |_| \\_\\_|   |_| |_|_|  |_|_|\r\n");
     console_set_color(COLOR_WHITE, COLOR_BLACK);
-    console_puts("  RaspberryOS Mini v0.1\r\n");
+    console_puts("  RaspberryOS Mini v0.2\r\n");
     console_puts("  Bare-metal OS for Raspberry Pi 4\r\n");
     console_puts("  ----------------------------------------\r\n\r\n");
 }
@@ -92,7 +93,6 @@ static void print_sysinfo(void) {
     uart_puts("  Board revision : 0x"); uart_puthex(board_rev); uart_puts("\r\n");
     if (g_video_available) {
         console_puts("  Board revision : 0x");
-        /* Hex вывод вручную */
         char hbuf[20];
         int hi = 18; hbuf[18] = '\0';
         uint64_t v = board_rev;
@@ -109,7 +109,6 @@ static void print_sysinfo(void) {
         uart_puts(" MB\r\n");
         if (g_video_available) {
             console_puts("  ARM memory     : ");
-            /* Простое десятичное */
             uint32_t mb = arm_size / (1024 * 1024);
             char dbuf[12]; int di = 10; dbuf[10] = '\0';
             if (mb == 0) { dbuf[--di] = '0'; }
@@ -192,6 +191,13 @@ static void subsystem_ok(const char *name) {
 static void subsystem_warn(const char *name, const char *reason) {
     uart_puts(COLOR_YELLOW_A "[ WARN ] " COLOR_RESET_A);
     uart_puts(name); uart_puts(": "); uart_puts(reason); uart_puts("\r\n");
+    if (g_video_available) {
+        console_set_color(COLOR_YELLOW, COLOR_BLACK);
+        console_puts("[ WARN ] ");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
+        console_puts(name); console_puts(": "); console_puts(reason);
+        console_puts("\r\n");
+    }
 }
 
 /* ================================================================
@@ -207,7 +213,6 @@ void kernel_main(void) {
     /* 2. GPIO */
     gpio_init();
     gpio_led_on();
-    /* Пока видео не инициализировано, пишем только в UART */
     uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A "GPIO initialized\r\n");
 
     /* 3. Таймер */
@@ -220,15 +225,13 @@ void kernel_main(void) {
     memory_init();
     uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A "Memory manager initialized\r\n");
 
-    /* 5. Видео — ключевой шаг */
+    /* 5. Видео */
     uart_puts("[ ... ] Initializing framebuffer (HDMI)...\r\n");
     if (video_init() == 0) {
         g_video_available = 1;
 
-        /* Рисуем баннер на HDMI */
         print_banner_hdmi();
 
-        /* Теперь дублируем предыдущие OK-сообщения на экран */
         console_set_color(COLOR_GREEN, COLOR_BLACK);
         console_puts("[  OK  ] ");
         console_set_color(COLOR_WHITE, COLOR_BLACK);
@@ -254,13 +257,41 @@ void kernel_main(void) {
     /* 6. Системная информация */
     print_sysinfo();
 
-    /* 7. Готово */
+    /* ================================================================
+     * 7. USB HID клавиатура                         <<<< ДОБАВЛЕНО
+     *
+     * Инициализируем после video чтобы статус был виден на HDMI.
+     * usb_init() ждёт подключения до 3 секунд — это нормально,
+     * пользователь видит сообщение "[ ... ] Waiting for USB...".
+     * Если клавиатура не подключена — продолжаем без неё (WARN).
+     * ================================================================ */
+    uart_puts("[ ... ] Initializing USB host (DWC2 OTG)...\r\n");
+    if (g_video_available) console_puts("[ ... ] Initializing USB host...\r\n");
+
+    if (usb_init() == 0) {
+        g_usb_available = 1;
+        subsystem_ok("USB HID keyboard ready");
+    } else {
+        g_usb_available = 0;
+        subsystem_warn("USB", "no keyboard detected — connect to lower USB 2.0 port");
+    }
+    /* ================================================================
+     * КОНЕЦ ДОБАВЛЕНИЯ
+     * ================================================================ */
+
+    /* 8. Готово */
     gpio_led_off();
 
     kputs(COLOR_GREEN_A "\r\n[BOOT] Kernel initialized successfully!\r\n" COLOR_RESET_A);
-    kputs("[BOOT] Type 'help' for available commands.\r\n\r\n");
+    kputs("[BOOT] Type 'help' for available commands.\r\n");
 
-    /* Если видео есть — сделаем приятный prompt на HDMI */
+    /* Подсказка про клавиатуру */
+    if (g_usb_available) {
+        kputs("[BOOT] USB keyboard active — type directly!\r\n");
+    }
+    kputs("\r\n");
+
+    /* Prompt на HDMI */
     if (g_video_available) {
         console_set_color(COLOR_CYAN, COLOR_BLACK);
         console_puts("RPiOS");
@@ -268,8 +299,8 @@ void kernel_main(void) {
         console_puts("> ");
         console_set_color(COLOR_WHITE, COLOR_BLACK);
     }
-    kputs("Type 'help' and press Enter...\r\n");
-    /* 8. Shell */
+
+    /* 9. Shell */
     shell_run();
 
     kernel_panic("shell_run() returned unexpectedly");

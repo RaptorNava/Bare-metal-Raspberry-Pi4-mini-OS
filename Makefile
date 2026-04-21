@@ -61,7 +61,8 @@ KERNEL_SRCS := \
 DRIVER_SRCS := \
     src/drivers/gpio.c    \
     src/drivers/mailbox.c \
-    src/drivers/uart.c
+    src/drivers/uart.c \
+    src/drivers/usb.c
 
 LIB_SRCS := \
     src/lib/printf.c \

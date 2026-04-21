@@ -1,6 +1,10 @@
 /**
  * shell.c — Интерактивный командный интерпретатор
  * Обновлён: вывод дублируется на HDMI через console_mux.h
+ *
+ * v0.2: Добавлен ввод с USB HID клавиатуры.
+ *       shell_readline() теперь опрашивает оба источника:
+ *       UART и USB клавиатуру одновременно.
  */
 
 #include "../../include/shell.h"
@@ -12,6 +16,7 @@
 #include "../../include/string.h"
 #include "../../include/printf.h"
 #include "../../include/console_mux.h"
+#include "../../include/usb.h"          /* <<<< ДОБАВЛЕНО */
 #include <stddef.h>
 
 /* ----------------------------------------------------------------
@@ -19,6 +24,7 @@
  * ---------------------------------------------------------------- */
 extern volatile int      g_video_available;
 extern volatile uint64_t g_uptime_ticks;
+extern volatile int      g_usb_available;   /* <<<< ДОБАВЛЕНО */
 extern uint64_t          kernel_get_uptime_ms(void);
 
 /* ----------------------------------------------------------------
@@ -43,9 +49,7 @@ static void sh_putc(char c) {
 
 /* Вывод числа в обоих каналах */
 static void sh_putdec(uint32_t v) {
-    /* В UART */
     uart_putdec(v);
-    /* В HDMI */
     if (!g_video_available) return;
     char buf[12]; int i = 10; buf[10] = '\0';
     if (v == 0) { buf[--i] = '0'; }
@@ -145,6 +149,7 @@ static int cmd_help(int argc, char *argv[]) {
         "  led <on|off|blink>- Control GPIO LED",
         "  video             - Video system info",
         "  play              - Play Bad Apple",
+        "  keyboard          - USB keyboard status",   /* <<<< ДОБАВЛЕНО */
         "  history           - Command history",
         "  reboot            - Reboot system",
         "  panic             - Test kernel panic",
@@ -167,7 +172,7 @@ static int cmd_clear(int argc, char *argv[]) {
 static int cmd_info(int argc, char *argv[]) {
     (void)argc; (void)argv;
     sh_puts(C_BOLD "=== System Information ===\r\n" C_RESET);
-    sh_puts("  OS      : RaspberryOS Mini v0.1\r\n");
+    sh_puts("  OS      : RaspberryOS Mini v0.2\r\n");
     sh_puts("  Arch    : AArch64 (ARM64)\r\n");
     sh_puts("  Board   : Raspberry Pi 4\r\n");
     sh_puts("  Output  : ");
@@ -176,6 +181,14 @@ static int cmd_info(int argc, char *argv[]) {
     } else {
         sh_puts("UART only\r\n");
     }
+    /* <<<< ДОБАВЛЕНО: статус USB клавиатуры */
+    sh_puts("  Input   : UART");
+    if (g_usb_available) {
+        sh_puts(" + USB HID Keyboard\r\n");
+    } else {
+        sh_puts(" only\r\n");
+    }
+    /* <<<< КОНЕЦ ДОБАВЛЕНИЯ */
     sh_puts("  Uptime  : ");
     uint64_t ms = kernel_get_uptime_ms();
     uint32_t sec = (uint32_t)(ms / 1000);
@@ -297,7 +310,6 @@ static int cmd_video(int argc, char *argv[]) {
     (void)argc; (void)argv;
     video_print_info();
     if (g_video_available) {
-        /* Дополнительно вывести консольные параметры на HDMI */
         int cols, rows;
         console_get_size(&cols, &rows);
         sh_puts("  Console : ");
@@ -313,6 +325,75 @@ static int cmd_play(int argc, char *argv[]) {
     video_play_bad_apple();
     return 0;
 }
+
+/* ================================================================
+ * <<<< ДОБАВЛЕНО: команда keyboard
+ * Показывает статус USB клавиатуры и последний принятый repot
+ * ================================================================ */
+static int cmd_keyboard(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+    sh_puts(C_BOLD "=== USB Keyboard Status ===\r\n" C_RESET);
+
+    if (!g_usb_available) {
+        sh_color_puts(COLOR_YELLOW, C_YELLOW,
+                      "  No USB HID keyboard detected.\r\n");
+        sh_puts("  Connect keyboard to the lower USB 2.0 port\r\n");
+        sh_puts("  (the port closest to the board edge).\r\n");
+        return 0;
+    }
+
+    const usb_kbd_t *kbd = usb_kbd_get_state();
+
+    sh_puts("  Status  : ");
+    sh_color_puts(COLOR_GREEN, C_GREEN, "Connected\r\n");
+
+    sh_puts("  Address : ");
+    sh_putdec(kbd->dev_addr);
+    sh_puts("\r\n");
+
+    sh_puts("  Speed   : ");
+    if      (kbd->speed == 0) sh_puts("High-Speed (480 Mbit/s)\r\n");
+    else if (kbd->speed == 1) sh_puts("Full-Speed (12 Mbit/s)\r\n");
+    else                      sh_puts("Low-Speed  (1.5 Mbit/s)\r\n");
+
+    sh_puts("  EP Intr : ");
+    sh_putdec(kbd->ep_intr);
+    sh_puts("  (MPS=");
+    sh_putdec(kbd->ep_mps);
+    sh_puts(" bytes)\r\n");
+
+    sh_puts("  Last report (HID): [");
+    int i;
+    for (i = 0; i < HID_KBD_BOOT_REPORT_SIZE; i++) {
+        sh_putc("0123456789ABCDEF"[kbd->report[i] >> 4]);
+        sh_putc("0123456789ABCDEF"[kbd->report[i] & 0xF]);
+        if (i < HID_KBD_BOOT_REPORT_SIZE - 1) sh_putc(' ');
+    }
+    sh_puts("]\r\n");
+
+    sh_puts("\r\n  Press any key to test (Enter to exit)...\r\n");
+    sh_puts("  ");
+
+    /* Простой тест: выводим символы с клавиатуры 5 секунд */
+    uint64_t start = kernel_get_uptime_ms();
+    while (kernel_get_uptime_ms() - start < 5000) {
+        timer_watchdog_kick();
+
+        /* Выход по Enter с UART */
+        char uc = uart_getc_nonblock();
+        if (uc == '\r' || uc == '\n') break;
+
+        /* Символ с USB клавиатуры */
+        char kc = usb_kbd_poll();
+        if (kc != 0) {
+            if (kc == '\n' || kc == '\r') break;
+            sh_putc(kc);
+        }
+    }
+    sh_puts("\r\n");
+    return 0;
+}
+/* <<<< КОНЕЦ ДОБАВЛЕНИЯ */
 
 static int cmd_history(int argc, char *argv[]) {
     (void)argc; (void)argv;
@@ -348,20 +429,21 @@ static int cmd_panic(int argc, char *argv[]) {
  * Таблица команд
  * ---------------------------------------------------------------- */
 static const shell_command_t commands[] = {
-    { "help",    "Show help",            cmd_help    },
-    { "clear",   "Clear screen",         cmd_clear   },
-    { "info",    "System info",          cmd_info    },
-    { "mem",     "Memory stats",         cmd_mem     },
-    { "uptime",  "Show uptime",          cmd_uptime  },
-    { "timer",   "Timer info",           cmd_timer   },
-    { "echo",    "Print text",           cmd_echo    },
-    { "hex",     "Memory dump",          cmd_hex     },
-    { "led",     "LED control",          cmd_led     },
-    { "video",   "Video info",           cmd_video   },
-    { "play",    "Play Bad Apple",       cmd_play    },
-    { "history", "Command history",      cmd_history },
-    { "reboot",  "Reboot system",        cmd_reboot  },
-    { "panic",   "Trigger kernel panic", cmd_panic   },
+    { "help",     "Show help",            cmd_help     },
+    { "clear",    "Clear screen",         cmd_clear    },
+    { "info",     "System info",          cmd_info     },
+    { "mem",      "Memory stats",         cmd_mem      },
+    { "uptime",   "Show uptime",          cmd_uptime   },
+    { "timer",    "Timer info",           cmd_timer    },
+    { "echo",     "Print text",           cmd_echo     },
+    { "hex",      "Memory dump",          cmd_hex      },
+    { "led",      "LED control",          cmd_led      },
+    { "video",    "Video info",           cmd_video    },
+    { "play",     "Play Bad Apple",       cmd_play     },
+    { "keyboard", "USB keyboard status",  cmd_keyboard }, /* <<<< ДОБАВЛЕНО */
+    { "history",  "Command history",      cmd_history  },
+    { "reboot",   "Reboot system",        cmd_reboot   },
+    { "panic",    "Trigger kernel panic", cmd_panic    },
     { NULL, NULL, NULL }
 };
 
@@ -391,9 +473,7 @@ static int execute_command(char *line) {
  * Вывод приглашения командной строки
  * ---------------------------------------------------------------- */
 static void print_prompt(void) {
-    /* UART — ANSI цвета */
     uart_puts("\033[36mRPiOS\033[0m\033[33m>\033[0m ");
-    /* HDMI — через console_set_color */
     if (g_video_available) {
         console_set_color(COLOR_CYAN, COLOR_BLACK);
         console_puts("RPiOS");
@@ -404,21 +484,30 @@ static void print_prompt(void) {
 }
 
 /* ----------------------------------------------------------------
- * Чтение строки: эхо дублируется на HDMI
+ * Чтение строки с поддержкой UART и USB клавиатуры
+ *
+ * Изменение v0.2: добавлен вызов usb_kbd_poll() в тот же tight loop.
+ * Логика обработки символов одинакова для обоих источников.
  * ---------------------------------------------------------------- */
-
 static int shell_readline(char *buf, int max_len) {
     int pos = 0;
     buf[0] = '\0';
 
-    sh_puts("\r\n");                    // гарантируем перевод строки
+    sh_puts("\r\n");
 
     while (1) {
-        timer_watchdog_kick();          // обязательно!
+        timer_watchdog_kick();
 
+        /* --- Получаем символ из любого источника --- */
         char c = uart_getc_nonblock();
 
-        if (c != 0) {                   // пришёл символ
+        /* <<<< ДОБАВЛЕНО: если UART молчит — пробуем USB клавиатуру */
+        if (c == 0 && g_usb_available) {
+            c = usb_kbd_poll();
+        }
+        /* <<<< КОНЕЦ ДОБАВЛЕНИЯ */
+
+        if (c != 0) {
             if (c == '\r' || c == '\n') {
                 sh_puts("\r\n");
                 buf[pos] = '\0';
@@ -435,13 +524,14 @@ static int shell_readline(char *buf, int max_len) {
             }
             else if (c >= 32 && c < 127 && pos < max_len - 1) {
                 buf[pos++] = c;
-                sh_putc(c);             // эхо сразу в оба канала
+                sh_putc(c);
             }
         }
-        // Tight poll — БЕЗ timer_delay_ms! Это главное исправление
-        asm volatile("nop");            // минимальная пауза, чтобы не грузить хост
+
+        asm volatile("nop");
     }
 }
+
 /* ----------------------------------------------------------------
  * ГЛАВНАЯ ФУНКЦИЯ SHELL
  * ---------------------------------------------------------------- */
