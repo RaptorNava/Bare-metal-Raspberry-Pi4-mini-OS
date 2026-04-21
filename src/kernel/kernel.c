@@ -1,23 +1,12 @@
 /**
- * kernel.c — Главный файл ядра операционной системы
+ * kernel.c — Главный файл ядра
  *
- * Это сердце ОС. После инициализации в boot.S управление
- * передаётся сюда, в функцию kernel_main().
- *
- * Порядок инициализации:
- *   1. UART — чтобы сразу видеть вывод
- *   2. GPIO — настройка пинов
- *   3. Таймер — для прерываний и планировщика
- *   4. Память — инициализация кучи
- *   5. Видео — если доступен framebuffer
- *   6. Shell — интерактивный терминал
- *
- * Подсистемы ОС:
- *   - Монолитное ядро (всё в одном адресном пространстве)
- *   - Кооперативная многозадачность через планировщик таймера
- *   - Базовое управление памятью (bump allocator)
- *   - Видеовывод через framebuffer
+ * Изменения:
+ *   - video_init() теперь реально инициализирует framebuffer
+ *   - После успешного video_init() весь вывод дублируется на HDMI
+ *   - shell_run() передаём флаг video_available для дублирования
  */
+
 #include <stddef.h>
 #include "../../include/uart.h"
 #include "../../include/gpio.h"
@@ -27,263 +16,261 @@
 #include "../../include/mailbox.h"
 #include "../../include/printf.h"
 #include "../../include/video.h"
+#include "../../include/console_mux.h"
 
-// ---------------------------------------------------------------
-// Версия ОС
-// ---------------------------------------------------------------
 #define OS_NAME     "RaspberryOS Mini"
 #define OS_VERSION  "0.1.0"
-#define OS_AUTHOR   "QEMU Test Build"
 
-// ---------------------------------------------------------------
-// Глобальные флаги состояния системы
-// ---------------------------------------------------------------
-volatile int g_kernel_panic = 0;        // Флаг критической ошибки
-volatile uint64_t g_uptime_ticks = 0;  // Счётчик тиков с момента запуска
-volatile int g_video_available = 0;    // Доступен ли framebuffer
+volatile int      g_kernel_panic    = 0;
+volatile uint64_t g_uptime_ticks    = 0;
+volatile int      g_video_available = 0;
 
-// ---------------------------------------------------------------
-// Прообраз таблицы системных вызовов (расширяется позже)
-// ---------------------------------------------------------------
-typedef struct {
-    const char *name;
-    void (*handler)(void);
-} syscall_entry_t;
+/* ----------------------------------------------------------------
+ * ANSI цвета для UART
+ * ---------------------------------------------------------------- */
+#define COLOR_RED_A    "\033[31m"
+#define COLOR_GREEN_A  "\033[32m"
+#define COLOR_YELLOW_A "\033[33m"
+#define COLOR_CYAN_A   "\033[36m"
+#define COLOR_BOLD_A   "\033[1m"
+#define COLOR_RESET_A  "\033[0m"
 
-// ---------------------------------------------------------------
-// Вспомогательная функция: вывод цветной строки
-// Используем ANSI escape-коды (работают в большинстве терминалов)
-// ---------------------------------------------------------------
-static void print_colored(const char *color, const char *msg) {
-    uart_puts(color);   // Код цвета (ANSI)
-    uart_puts(msg);
-    uart_puts("\033[0m");  // Сброс цвета
+/* ----------------------------------------------------------------
+ * Вывод: UART + HDMI (если доступен)
+ * ---------------------------------------------------------------- */
+static void kputs(const char *s) {
+    uart_puts(s);
+    if (g_video_available) console_puts(s);
 }
 
-// ANSI цветовые коды
-#define COLOR_RED     "\033[31m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_YELLOW  "\033[33m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_CYAN    "\033[36m"
-#define COLOR_BOLD    "\033[1m"
-#define COLOR_RESET   "\033[0m"
-
-// ---------------------------------------------------------------
-// Вывод баннера при загрузке
-// ---------------------------------------------------------------
+/* ----------------------------------------------------------------
+ * Баннер
+ * ---------------------------------------------------------------- */
 static void print_banner(void) {
     uart_puts("\r\n");
-    uart_puts(COLOR_CYAN);
+    uart_puts(COLOR_CYAN_A);
     uart_puts("  ____  ____  _   _ ___  ___ \r\n");
     uart_puts(" |  _ \\|  _ \\(_) | |  \\/  | |\r\n");
     uart_puts(" | |_) | |_) | | | | |\\/| | |\r\n");
     uart_puts(" |  _ <|  __/| | | | |  | | |\r\n");
     uart_puts(" |_| \\_\\_|   |_| |_|_|  |_|_|\r\n");
-    uart_puts(COLOR_RESET);
-    uart_puts(COLOR_BOLD);
+    uart_puts(COLOR_RESET_A);
+    uart_puts(COLOR_BOLD_A);
     uart_puts("  RaspberryOS Mini v0.1\r\n");
-    uart_puts(COLOR_RESET);
+    uart_puts(COLOR_RESET_A);
     uart_puts("  Bare-metal OS for Raspberry Pi 4\r\n");
-    uart_puts("  Running on QEMU (aarch64-virt or raspi4b)\r\n");
-    uart_puts("\r\n");
-    uart_puts("  ----------------------------------------\r\n");
+    uart_puts("  ----------------------------------------\r\n\r\n");
 }
 
-// ---------------------------------------------------------------
-// Вывод информации о системе
-// ---------------------------------------------------------------
+/* ----------------------------------------------------------------
+ * Вывод на HDMI-консоль без ANSI (framebuffer не понимает все коды)
+ * ---------------------------------------------------------------- */
+static void print_banner_hdmi(void) {
+    console_set_color(COLOR_CYAN, COLOR_BLACK);
+    console_puts("  ____  ____  _   _ ___  ___ \r\n");
+    console_puts(" |  _ \\|  _ \\(_) | |  \\/  | |\r\n");
+    console_puts(" | |_) | |_) | | | | |\\/| | |\r\n");
+    console_puts(" |  _ <|  __/| | | | |  | | |\r\n");
+    console_puts(" |_| \\_\\_|   |_| |_|_|  |_|_|\r\n");
+    console_set_color(COLOR_WHITE, COLOR_BLACK);
+    console_puts("  RaspberryOS Mini v0.1\r\n");
+    console_puts("  Bare-metal OS for Raspberry Pi 4\r\n");
+    console_puts("  ----------------------------------------\r\n\r\n");
+}
+
+/* ----------------------------------------------------------------
+ * print_sysinfo
+ * ---------------------------------------------------------------- */
 static void print_sysinfo(void) {
     uint32_t board_rev;
-    uint32_t arm_base, arm_size;
+    uint32_t arm_base = 0, arm_size = 0;
     uint32_t uart_clock;
-    
-    uart_puts(COLOR_GREEN);
-    uart_puts("[BOOT] ");
-    uart_puts(COLOR_RESET);
-    uart_puts("System information:\r\n");
-    
-    // Получаем информацию через Mailbox
+
+    kputs("[BOOT] System information:\r\n");
+
     board_rev = mbox_get_board_revision();
-    uart_puts("  Board revision : 0x");
-    uart_puthex(board_rev);
-    uart_puts("\r\n");
-    
+    uart_puts("  Board revision : 0x"); uart_puthex(board_rev); uart_puts("\r\n");
+    if (g_video_available) {
+        console_puts("  Board revision : 0x");
+        /* Hex вывод вручную */
+        char hbuf[20];
+        int hi = 18; hbuf[18] = '\0';
+        uint64_t v = board_rev;
+        hbuf[0] = '0'; hbuf[1] = 'x';
+        for (; hi >= 2; hi--) {
+            hbuf[hi] = "0123456789ABCDEF"[v & 0xF]; v >>= 4;
+        }
+        console_puts(hbuf); console_puts("\r\n");
+    }
+
     if (mbox_get_arm_memory(&arm_base, &arm_size)) {
         uart_puts("  ARM memory     : ");
         uart_putdec(arm_size / (1024 * 1024));
-        uart_puts(" MB at 0x");
-        uart_puthex(arm_base);
-        uart_puts("\r\n");
+        uart_puts(" MB\r\n");
+        if (g_video_available) {
+            console_puts("  ARM memory     : ");
+            /* Простое десятичное */
+            uint32_t mb = arm_size / (1024 * 1024);
+            char dbuf[12]; int di = 10; dbuf[10] = '\0';
+            if (mb == 0) { dbuf[--di] = '0'; }
+            else { while (mb > 0) { dbuf[--di] = '0' + (mb % 10); mb /= 10; } }
+            console_puts(&dbuf[di]); console_puts(" MB\r\n");
+        }
     }
-    
-    uart_clock = mbox_get_clock_rate(2);  // UART clock
+
+    uart_clock = mbox_get_clock_rate(2);
     if (uart_clock) {
         uart_puts("  UART clock     : ");
         uart_putdec(uart_clock / 1000000);
         uart_puts(" MHz\r\n");
     }
-    
-    // Информация о таймере
+
     uart_puts("  Timer interval : ");
     uart_putdec(TIMER_INTERVAL_US / 1000);
-    uart_puts(" ms\r\n");
-    
-    uart_puts("\r\n");
+    uart_puts(" ms\r\n\r\n");
+    if (g_video_available) {
+        console_puts("  UART + HDMI output active\r\n\r\n");
+    }
 }
 
-// ---------------------------------------------------------------
-// Функция: kernel_panic(const char *msg)
-// Вызывается при фатальной ошибке
-// Выводит сообщение об ошибке и останавливает систему
-// ---------------------------------------------------------------
+/* ----------------------------------------------------------------
+ * kernel_panic
+ * ---------------------------------------------------------------- */
 void kernel_panic(const char *msg) {
-    // Запрещаем все прерывания
-    asm volatile("msr daifset, #0xF");  // Маскируем D, A, I, F
-    
+    asm volatile("msr daifset, #0xF");
     g_kernel_panic = 1;
-    
-    uart_puts("\r\n");
-    uart_puts(COLOR_RED);
+
+    uart_puts("\r\n" COLOR_RED_A);
     uart_puts("╔══════════════════════════════════════╗\r\n");
     uart_puts("║          KERNEL PANIC                ║\r\n");
     uart_puts("╚══════════════════════════════════════╝\r\n");
-    uart_puts(COLOR_RESET);
-    uart_puts("PANIC: ");
+    uart_puts(COLOR_RESET_A "PANIC: ");
     uart_puts(msg);
-    uart_puts("\r\n");
-    uart_puts("System halted. Reset required.\r\n");
-    
-    // Мигаем LED — быстрое мигание означает критическую ошибку
-    gpio_led_blink(10);
-    
-    // Останавливаем систему
-    while (1) {
-        asm volatile("wfe");
+    uart_puts("\r\nSystem halted.\r\n");
+
+    if (g_video_available) {
+        console_set_color(COLOR_RED, COLOR_BLACK);
+        console_puts("\r\n*** KERNEL PANIC ***\r\n");
+        console_puts(msg);
+        console_puts("\r\nSystem halted.\r\n");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
     }
+
+    gpio_led_blink(10);
+    while (1) asm volatile("wfe");
 }
 
-// ---------------------------------------------------------------
-// Функция: handle_irq()
-// Вызывается из boot.S при IRQ прерывании
-// Перенаправляет обработку к таймеру и планировщику
-// ---------------------------------------------------------------
+/* ----------------------------------------------------------------
+ * handle_irq
+ * ---------------------------------------------------------------- */
 void handle_irq(void) {
-    // Увеличиваем счётчик тиков
     g_uptime_ticks++;
-    
-    // Обрабатываем таймерное прерывание
     timer_handle_irq();
-    
-    // Здесь можно добавить обработку других IRQ:
-    // - UART RX (получение данных)
-    // - GPIO события
-    // - USB
 }
 
-// ---------------------------------------------------------------
-// Функция: kernel_get_uptime_ms()
-// Возвращает время работы системы в миллисекундах
-// ---------------------------------------------------------------
+/* ----------------------------------------------------------------
+ * kernel_get_uptime_ms
+ * ---------------------------------------------------------------- */
 uint64_t kernel_get_uptime_ms(void) {
-    // TIMER_INTERVAL_US — интервал таймера в микросекундах
     return (g_uptime_ticks * TIMER_INTERVAL_US) / 1000;
 }
 
-// ---------------------------------------------------------------
-// Инициализация подсистем ОС (с диагностическим выводом)
-// ---------------------------------------------------------------
+/* ----------------------------------------------------------------
+ * Вспомогательные статусные сообщения
+ * ---------------------------------------------------------------- */
 static void subsystem_ok(const char *name) {
-    print_colored(COLOR_GREEN, "[  OK  ] ");
-    uart_puts(name);
-    uart_puts("\r\n");
+    uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A);
+    uart_puts(name); uart_puts("\r\n");
+    if (g_video_available) {
+        console_set_color(COLOR_GREEN, COLOR_BLACK);
+        console_puts("[  OK  ] ");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
+        console_puts(name); console_puts("\r\n");
+    }
 }
 
-static void subsystem_fail(const char *name, const char *reason) {
-    print_colored(COLOR_YELLOW, "[ WARN ] ");
-    uart_puts(name);
-    uart_puts(": ");
-    uart_puts(reason);
-    uart_puts("\r\n");
+static void subsystem_warn(const char *name, const char *reason) {
+    uart_puts(COLOR_YELLOW_A "[ WARN ] " COLOR_RESET_A);
+    uart_puts(name); uart_puts(": "); uart_puts(reason); uart_puts("\r\n");
 }
 
-// ---------------------------------------------------------------
-// ГЛАВНАЯ ФУНКЦИЯ ЯДРА
-// Сюда попадаем из boot.S после базовой настройки процессора
-// ---------------------------------------------------------------
+/* ================================================================
+ * ГЛАВНАЯ ФУНКЦИЯ ЯДРА
+ * ================================================================ */
 void kernel_main(void) {
-    // =============================================================
-    // ШАГ 1: UART — должен быть первым, чтобы видеть остальные сообщения
-    // =============================================================
+
+    /* 1. UART — первым, чтобы видеть отладку */
     uart_init();
-    
-    // Очищаем экран и выводим баннер
-    uart_puts("\033[2J\033[H");     // ANSI: очистить экран, курсор в начало
+    uart_puts("\033[2J\033[H");
     print_banner();
-    
-    // =============================================================
-    // ШАГ 2: GPIO
-    // =============================================================
+
+    /* 2. GPIO */
     gpio_init();
-    gpio_led_on();      // LED горит во время инициализации
-    subsystem_ok("GPIO driver initialized");
-    
-    // =============================================================
-    // ШАГ 3: Системный таймер + прерывания
-    // =============================================================
-    // Настраиваем векторную таблицу прерываний
-    // Регистр VBAR_EL1 указывает на нашу таблицу из boot.S
-    extern void vectors(); 
+    gpio_led_on();
+    /* Пока видео не инициализировано, пишем только в UART */
+    uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A "GPIO initialized\r\n");
+
+    /* 3. Таймер */
+    extern void vectors(void);
     asm volatile("msr vbar_el1, %0" :: "r"((uint64_t)vectors) : "memory");
-    
-    // Инициализируем таймер (настраивает регистры и включает прерывания)
     timer_init();
-    
-    // Разрешаем IRQ прерывания (сбрасываем I-бит в DAIF)
-    //asm volatile("msr daifclr, #2");    // Бит 2 = I (IRQ)
-    
-    subsystem_ok("Timer initialized (watchdog + scheduler)");
-    
-    // =============================================================
-    // ШАГ 4: Система памяти
-    // =============================================================
+    uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A "Timer initialized\r\n");
+
+    /* 4. Память */
     memory_init();
-    subsystem_ok("Memory manager initialized");
-    
-    // =============================================================
-    // ШАГ 5: Получаем информацию о системе
-    // =============================================================
-    print_sysinfo();
-    
-    // =============================================================
-    // ШАГ 6: Инициализация видео (framebuffer)
-    // =============================================================
+    uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A "Memory manager initialized\r\n");
+
+    /* 5. Видео — ключевой шаг */
+    uart_puts("[ ... ] Initializing framebuffer (HDMI)...\r\n");
     if (video_init() == 0) {
         g_video_available = 1;
-        subsystem_ok("Video framebuffer initialized (1024x768)");
+
+        /* Рисуем баннер на HDMI */
+        print_banner_hdmi();
+
+        /* Теперь дублируем предыдущие OK-сообщения на экран */
+        console_set_color(COLOR_GREEN, COLOR_BLACK);
+        console_puts("[  OK  ] ");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
+        console_puts("GPIO initialized\r\n");
+
+        console_set_color(COLOR_GREEN, COLOR_BLACK);
+        console_puts("[  OK  ] ");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
+        console_puts("Timer initialized\r\n");
+
+        console_set_color(COLOR_GREEN, COLOR_BLACK);
+        console_puts("[  OK  ] ");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
+        console_puts("Memory initialized\r\n");
+
+        subsystem_ok("Video framebuffer initialized");
+        uart_puts(COLOR_GREEN_A "[  OK  ] " COLOR_RESET_A "Video framebuffer initialized\r\n");
     } else {
         g_video_available = 0;
-        subsystem_fail("Video", "framebuffer not available in QEMU virt mode");
+        subsystem_warn("Video", "framebuffer unavailable — UART only mode");
     }
-    
-    // =============================================================
-    // ШАГ 7: Всё готово
-    // =============================================================
-    gpio_led_off();     // Выключаем LED — инициализация завершена
-    
-    uart_puts(COLOR_GREEN);
-    uart_puts("\r\n[BOOT] Kernel initialized successfully!\r\n");
-    uart_puts(COLOR_RESET);
-    uart_puts("[BOOT] Type 'help' for available commands.\r\n\r\n");
-    
-    // =============================================================
-    // ШАГ 8: Запуск интерактивного командного интерпретатора
-    // shell_run() — бесконечный цикл, обрабатывает команды пользователя
-    // =============================================================
+
+    /* 6. Системная информация */
+    print_sysinfo();
+
+    /* 7. Готово */
+    gpio_led_off();
+
+    kputs(COLOR_GREEN_A "\r\n[BOOT] Kernel initialized successfully!\r\n" COLOR_RESET_A);
+    kputs("[BOOT] Type 'help' for available commands.\r\n\r\n");
+
+    /* Если видео есть — сделаем приятный prompt на HDMI */
+    if (g_video_available) {
+        console_set_color(COLOR_CYAN, COLOR_BLACK);
+        console_puts("RPiOS");
+        console_set_color(COLOR_YELLOW, COLOR_BLACK);
+        console_puts("> ");
+        console_set_color(COLOR_WHITE, COLOR_BLACK);
+    }
+    kputs("Type 'help' and press Enter...\r\n");
+    /* 8. Shell */
     shell_run();
-    
-    // =============================================================
-    // Сюда попасть не должны
-    // =============================================================
+
     kernel_panic("shell_run() returned unexpectedly");
 }

@@ -11,8 +11,6 @@ OBJCOPY := $(CROSS)-objcopy
 OBJDUMP := $(CROSS)-objdump
 NM      := $(CROSS)-nm
 
-# --- ДОПОЛНЕНИЕ: Автоматический поиск системных инклудов компилятора ---
-# Это решает ошибку "fatal error: stdint.h: No such file or directory"
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
 # ---------------------------------------------------------------------------
@@ -50,7 +48,7 @@ LDFLAGS := \
     -T linker.ld
 
 # ---------------------------------------------------------------------------
-# Исходные файлы (согласно твоей структуре src/)
+# Исходные файлы
 # ---------------------------------------------------------------------------
 BOOT_SRC    := src/boot.S
 
@@ -67,12 +65,14 @@ DRIVER_SRCS := \
 
 LIB_SRCS := \
     src/lib/printf.c \
-    src/lib/string.c
+    src/lib/string.c \
+    src/lib/font.c
 
 MEDIA_SRCS := \
     src/media/audio.c \
     src/media/video.c \
     src/media/video_data.c
+
 ALL_SRCS := $(KERNEL_SRCS) $(DRIVER_SRCS) $(LIB_SRCS) $(MEDIA_SRCS)
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,6 @@ ALL_SRCS := $(KERNEL_SRCS) $(DRIVER_SRCS) $(LIB_SRCS) $(MEDIA_SRCS)
 BUILD_DIR   := build
 
 BOOT_OBJ    := $(BUILD_DIR)/boot.o
-# Превращаем путь src/path/file.c в build/path/file.o
 KERNEL_OBJS := $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(ALL_SRCS))
 ALL_OBJS    := $(BOOT_OBJ) $(KERNEL_OBJS)
 
@@ -104,6 +103,7 @@ QEMU_FLAGS_RASPI := \
     -kernel $(TARGET_IMG) \
     -serial stdio \
     -display none
+
 QEMU_FLAGS_VIRT := \
     -M virt \
     -cpu cortex-a72 \
@@ -120,29 +120,24 @@ QEMU_FLAGS_VIRT := \
 
 all: $(TARGET_IMG)
 
-# Создание итогового образа
 $(TARGET_IMG): $(TARGET_ELF)
 	@echo "--- Copying ELF to BIN ---"
 	$(OBJCOPY) -O binary $< $@
-	@echo "✓  $@ ready ($$(wc -c < $@) bytes)"
+	@echo "kernel8.img ready ($$(wc -c < $@) bytes)"
 
-# Линковка
 $(TARGET_ELF): $(ALL_OBJS) linker.ld
 	@echo "--- Linking ---"
 	$(LD) $(LDFLAGS) -Map=$(TARGET_MAP) -o $@ $(ALL_OBJS)
 
-# Компиляция ASM
 $(BUILD_DIR)/boot.o: src/boot.S | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) -c $< -o $@
 
-# Компиляция C (универсальное правило)
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "Compiling: $<"
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Создание структуры папок в build
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 	@mkdir -p $(BUILD_DIR)/kernel
@@ -151,7 +146,7 @@ $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)/media
 
 # ===========================================================================
-# Команды управления
+# Команды
 # ===========================================================================
 
 run: $(TARGET_IMG)
@@ -162,7 +157,7 @@ run-virt: $(TARGET_ELF)
 
 clean:
 	@rm -rf $(BUILD_DIR) $(TARGET_IMG)
-	@echo "✓ Cleaned."
+	@echo "Cleaned."
 
 dump: $(TARGET_ELF)
 	$(OBJDUMP) -d -S $(TARGET_ELF) > $(TARGET_LST)
