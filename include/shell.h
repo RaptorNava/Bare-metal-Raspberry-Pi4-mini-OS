@@ -8,7 +8,7 @@
 /* Объявляем kernel_panic здесь, чтобы shell.c мог её вызвать
  * без отдельного kernel.h */
 void kernel_panic(const char *msg);
-
+void shell_input(char c);
 void shell_run(void);
 
 #endif /* SHELL_H */
